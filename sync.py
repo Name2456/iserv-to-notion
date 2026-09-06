@@ -2,6 +2,8 @@
 """
 IServ to Notion Sync — IMAP version
 Fetches emails via IMAP and syncs them to a Notion database.
+Deletes all existing entries before syncing to keep content fresh.
+Includes full email body as page content.
 """
 
 import os
@@ -24,6 +26,7 @@ NOTION_API_URL = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 MAX_EMAILS = 50
 RATE_LIMIT_SEC = 0.35
+BODY_MAX_CHARS = 4000
 
 
 def validate_config():
@@ -34,8 +37,15 @@ def validate_config():
         sys.exit(1)
 
 
+def notion_headers():
+    return {
+        "Authorization": "Bearer " + NOTION_TOKEN,
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
 def get_imap_host():
-    """Extract hostname from ISERV_URL (strip protocol/path)."""
     host = ISERV_URL.strip()
     host = host.replace("https://", "").replace("http://", "")
     host = host.replace("/iserv/", "").replace("/iserv", "")
@@ -58,7 +68,73 @@ def strip_html(text):
     s = re.sub(r'<[^>]+>', '', text)
     s = s.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
     s = s.replace('&quot;', '"').replace('&#39;', "'")
-    return s.strip()
+    s = s.replace('&nbsp;', ' ').replace('\xa0', ' ')
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def delete_all_pages():
+    """Archive all existing pages in the Notion database."""
+    print("Deleting existing pages...", flush=True)
+    cursor = None
+    has_more = True
+    count = 0
+    while has_more:
+        body = {"page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        resp = requests.post(
+            NOTION_API_URL + "/databases/" + NOTION_DATABASE_ID + "/query",
+            headers=notion_headers(),
+            json=body,
+        )
+        if resp.status_code != 200:
+            print(f"  Query failed: {resp.status_code} {resp.text[:200]}", flush=True)
+            break
+        data = resp.json()
+        for page in data.get("results", []):
+            page_id = page["id"]
+            arch_resp = requests.patch(
+                NOTION_API_URL + "/pages/" + page_id,
+                headers=notion_headers(),
+                json={"archived": True},
+            )
+            if arch_resp.status_code == 200:
+                count += 1
+            time.sleep(0.1)
+        has_more = data.get("has_more", False)
+        cursor = data.get("next_cursor")
+    print(f"  Deleted {count} existing pages", flush=True)
+
+
+def extract_body(msg):
+    """Extract text body from email message."""
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    body = payload.decode(charset, errors="ignore")
+                    return body
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    html = payload.decode(charset, errors="ignore")
+                    return strip_html(html)
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            body = payload.decode(charset, errors="ignore")
+            if msg.get_content_type() == "text/html":
+                body = strip_html(body)
+    return body
 
 
 def fetch_emails_imap():
@@ -105,24 +181,24 @@ def fetch_emails_imap():
     print(f"  Found {len(msg_ids)} messages", flush=True)
 
     fetch_ids = msg_ids[-MAX_EMAILS:] if len(msg_ids) > MAX_EMAILS else msg_ids
-    fetch_ids = list(reversed(fetch_ids))  # newest first
+    fetch_ids = list(reversed(fetch_ids))
 
     emails = []
     for mid in fetch_ids:
         try:
-            status, fetch_data = imap.fetch(mid, "(UID FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+            status, fetch_data = imap.fetch(mid, "(UID FLAGS BODY.PEEK[])")
             if status != "OK":
                 continue
 
             uid = None
             flags = []
-            raw_headers = b""
+            raw_email = b""
 
             for item in fetch_data:
                 if isinstance(item, tuple):
                     meta = item[0].decode("utf-8", errors="ignore") if isinstance(item[0], bytes) else str(item[0])
                     content = item[1] if isinstance(item[1], bytes) else b""
-                    raw_headers = content
+                    raw_email = content
 
                     uid_match = re.search(r'UID (\d+)', meta)
                     if uid_match:
@@ -132,7 +208,7 @@ def fetch_emails_imap():
                     if flags_match:
                         flags = flags_match.group(1).split()
 
-            msg = email.message_from_bytes(raw_headers)
+            msg = email.message_from_bytes(raw_email)
             subject = decode_mime(msg.get("Subject", ""))
             sender = decode_mime(msg.get("From", ""))
             date_str = msg.get("Date", "")
@@ -147,24 +223,15 @@ def fetch_emails_imap():
 
             is_read = "\\Seen" in flags
 
-            preview = ""
-            try:
-                status, body_data = imap.fetch(mid, "(BODY.PEEK[1]<0.1000>)")
-                if status == "OK":
-                    for item in body_data:
-                        if isinstance(item, tuple) and isinstance(item[1], bytes):
-                            body_text = item[1].decode("utf-8", errors="ignore")
-                            preview = strip_html(body_text)[:200]
-                            break
-            except Exception:
-                pass
+            body = extract_body(msg)
+            preview = body[:200].strip() if body else ""
+            if len(body) > 200:
+                preview = preview + "..."
 
             if not subject:
                 subject = "(Kein Betreff)"
             if not sender:
                 sender = "Unbekannt"
-            if preview and len(preview) > 200:
-                preview = preview[:200] + "..."
 
             emails.append({
                 "uid": uid,
@@ -173,6 +240,7 @@ def fetch_emails_imap():
                 "date_iso": date_iso,
                 "is_read": is_read,
                 "preview": preview,
+                "body": body[:BODY_MAX_CHARS],
             })
 
             print(f"  Fetched: {subject[:50]} | from={sender[:30]}", flush=True)
@@ -185,40 +253,6 @@ def fetch_emails_imap():
     imap.logout()
     print(f"  Logged out. Fetched {len(emails)} emails.", flush=True)
     return emails
-
-
-def notion_headers():
-    return {
-        "Authorization": "Bearer " + NOTION_TOKEN,
-        "Notion-Version": NOTION_VERSION,
-        "Content-Type": "application/json",
-    }
-
-
-def get_existing_uids():
-    existing = set()
-    cursor = None
-    has_more = True
-    while has_more:
-        body = {"page_size": 100}
-        if cursor:
-            body["start_cursor"] = cursor
-        resp = requests.post(
-            NOTION_API_URL + "/databases/" + NOTION_DATABASE_ID + "/query",
-            headers=notion_headers(),
-            json=body,
-        )
-        if resp.status_code != 200:
-            break
-        data = resp.json()
-        for page in data.get("results", []):
-            props = page.get("properties", {})
-            rt = props.get("IServ UID", {}).get("rich_text", [])
-            if rt:
-                existing.add(rt[0].get("plain_text", ""))
-        has_more = data.get("has_more", False)
-        cursor = data.get("next_cursor")
-    return existing
 
 
 def create_notion_page(em):
@@ -234,10 +268,29 @@ def create_notion_page(em):
     if em["uid"]:
         properties["IServ UID"] = {"rich_text": [{"text": {"content": em["uid"]}}]}
 
+    children = []
+    if em.get("body"):
+        children.append({"object": "block", "type": "divider", "divider": {}})
+        remaining = em["body"]
+        while remaining and len(children) < 5:
+            chunk = remaining[:2000]
+            remaining = remaining[2000:]
+            children.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"type": "text", "text": {"content": chunk}}]
+                }
+            })
+
+    payload = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties}
+    if children:
+        payload["children"] = children
+
     resp = requests.post(
         NOTION_API_URL + "/pages",
         headers=notion_headers(),
-        json={"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties},
+        json=payload,
     )
     if resp.status_code == 200:
         print(f"  Created: {em['subject'][:60]}", flush=True)
@@ -252,6 +305,8 @@ def main():
     print("IServ -> Notion Sync — IMAP version", flush=True)
     print("=" * 60, flush=True)
     validate_config()
+
+    delete_all_pages()
 
     try:
         emails = fetch_emails_imap()
@@ -269,14 +324,8 @@ def main():
     for i, em in enumerate(emails[:3]):
         print(f"  Email {i}: subject='{em['subject'][:50]}' sender='{em['sender'][:50]}' uid='{em['uid']}'", flush=True)
 
-    existing = get_existing_uids()
-    print(f"  Existing UIDs in Notion: {len(existing)}", flush=True)
-
-    new = skip = err = 0
+    new = err = 0
     for em in emails:
-        if em["uid"] and em["uid"] in existing:
-            skip += 1
-            continue
         try:
             if create_notion_page(em):
                 new += 1
@@ -287,7 +336,7 @@ def main():
             err += 1
         time.sleep(RATE_LIMIT_SEC)
 
-    print(f"\nSync complete: {new} new | {skip} skipped | {err} errors", flush=True)
+    print(f"\nSync complete: {new} new | {err} errors", flush=True)
 
 
 if __name__ == "__main__":
