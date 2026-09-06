@@ -24,7 +24,7 @@ NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
 
 NOTION_API_URL = "https://api.notion.com/v1"
-NOTION_VERSION = "2022-06-28"
+NOTION_VERSION = "2025-09-03"  # Updated: File Upload API requires newer version
 DAYS_BACK = 30
 RATE_LIMIT_SEC = 0.35
 BODY_MAX_CHARS = 4000
@@ -389,7 +389,7 @@ def create_notion_page(em):
     for att in em.get("attachments", []):
         file_upload_id = upload_file_to_notion(att["filename"], att["content"], att["content_type"])
         if file_upload_id:
-            file_uploads.append({"name": att["filename"], "file_upload_id": file_upload_id})
+            file_uploads.append({"type": "file_upload", "file_upload": {"id": file_upload_id}, "name": att["filename"]})
             print(f"    Uploaded: {att['filename']}", flush=True)
 
     if file_uploads:
@@ -430,6 +430,7 @@ def create_notion_page(em):
 def main():
     print("=" * 60, flush=True)
     print("IServ -> Notion Sync — IMAP version (last 30 days)", flush=True)
+    print("Notion API version: " + NOTION_VERSION, flush=True)
     print("=" * 60, flush=True)
     validate_config()
 
