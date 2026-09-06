@@ -2,9 +2,8 @@ name: IServ to Notion Sync
 
 on:
   schedule:
-    # Runs daily at 06:00 UTC = 08:00 CET / 07:00 UTC+1 (Berlin)
     - cron: '0 6 * * *'
-  workflow_dispatch: # Allow manual triggering
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -37,7 +36,8 @@ jobs:
         with:
           name: iserv-debug
           path: |
-            debug_raw_response.html
-            debug_parsed_data.json
-            debug_script_content.txt
+            debug_get_emails.json
+            debug_raw_json.html
+            debug_raw_json_parsed.json
+            debug_xhr_parsed.json
           if-no-files-found: ignore
