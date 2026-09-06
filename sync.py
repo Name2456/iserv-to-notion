@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IServ to Notion Sync — DEBUG BUILD v4
+IServ to Notion Sync — DEBUG BUILD v5
 """
 
 import os
@@ -50,18 +50,12 @@ def validate_config() -> None:
         sys.exit(1)
 
 
-def _find_lists(obj: Any, path: str = "") -> List[tuple]:
-    """Recursively find all lists in a nested dict/list structure."""
-    results = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            results.extend(_find_lists(v, f"{path}.{k}"))
-    elif isinstance(obj, list):
-        if obj:
-            results.append((path, len(obj), type(obj[0]).__name__))
-        for i, v in enumerate(obj[:3]):
-            results.extend(_find_lists(v, f"{path}[{i}]"))
-    return results
+def build_mail_url(extra_params=""):
+    """Build mail API URL using string concatenation to avoid f-string brace issues."""
+    base = "https://" + ISERV_URL + "/iserv/mail/api/message/list?path=INBOX&length=" + str(MAX_EMAILS) + "&start=0&order%5Bcolumn%5D=date&order%5Bdir%5D=desc"
+    if extra_params:
+        base += "&" + extra_params
+    return base
 
 
 def fetch_and_debug() -> List[Dict[str, Any]]:
@@ -71,107 +65,110 @@ def fetch_and_debug() -> List[Dict[str, Any]]:
     print("  Login: OK", flush=True)
     session = iserv._session
 
-    # --- Method A: get_emails() ---
-    print("=" * 60, flush=True)
-    print("STEP 2A: get_emails()", flush=True)
-    try:
-        raw_a = iserv.get_emails(path="INBOX", length=MAX_EMAILS, start=0, order="date", dir="desc")
-        print(f"  Type: {type(raw_a).__name__}", flush=True)
-        if isinstance(raw_a, dict):
-            print(f"  Keys: {list(raw_a.keys())}", flush=True)
-            for k, v in raw_a.items():
-                content = json.dumps(v, ensure_ascii=False, default=str)
-                if len(content) > 3000:
-                    print(f"  {k} (first 3000 chars):", flush=True)
-                    print(f"    {content[:3000]}", flush=True)
-                else:
-                    print(f"  {k}: {content}", flush=True)
-            with open("debug_get_emails.json", "w", encoding="utf-8") as f:
-                json.dump(raw_a, f, ensure_ascii=False, default=str, indent=2)
-            lists = _find_lists(raw_a)
-            if lists:
-                print("  Lists found in structure:", flush=True)
-                for path, length, item_type in lists:
-                    print(f"    {path}: list of {length} {item_type}", flush=True)
-    except Exception as exc:
-        print(f"  FAILED: {exc}", flush=True)
-        import traceback; traceback.print_exc()
-        raw_a = None
+    mail_url = build_mail_url()
+    print(f"  Mail URL: {mail_url}", flush=True)
 
-    # --- Method B: Raw request with Accept: application/json ---
+    # --- Method A: Accept: application/json ---
     print("=" * 60, flush=True)
-    print("STEP 2B: Raw request with Accept: application/json", flush=True)
-    mail_url = f"{{https://{ISERV_URL}}}/iserv/mail/api/message/list?path=INBOX&length={MAX_EMAILS}&start=0&order%5Bcolumn%5D=date&order%5Bdir%5D=desc"
-    print(f"  URL: {mail_url}", flush=True)
+    print("STEP 2A: Raw request with Accept: application/json", flush=True)
     try:
         resp = session.get(mail_url, headers={"Accept": "application/json"})
         print(f"  Status: {resp.status_code}", flush=True)
         print(f"  Content-Type: {resp.headers.get('Content-Type', 'unknown')}", flush=True)
         print(f"  Length: {len(resp.text)} chars", flush=True)
-        with open("debug_raw_json.html", "w", encoding="utf-8") as f:
+        with open("debug_resp_a.txt", "w", encoding="utf-8") as f:
             f.write(resp.text)
         try:
-            raw_b = resp.json()
-            print(f"  JSON parsed OK, type: {type(raw_b).__name__}", flush=True)
-            if isinstance(raw_b, dict):
-                print(f"  Keys: {list(raw_b.keys())}", flush=True)
-                if "data" in raw_b and isinstance(raw_b["data"], list):
-                    print(f"  data: {len(raw_b['data'])} items", flush=True)
-                    if raw_b["data"] and isinstance(raw_b["data"][0], dict):
-                        print(f"  data[0] keys: {list(raw_b['data'][0].keys())}", flush=True)
-                        for k, v in raw_b["data"][0].items():
-                            print(f"    {k}: {str(v)[:200]}", flush=True)
-            elif isinstance(raw_b, list):
-                print(f"  List length: {len(raw_b)}", flush=True)
-                if raw_b and isinstance(raw_b[0], dict):
-                    print(f"  [0] keys: {list(raw_b[0].keys())}", flush=True)
-                    for k, v in raw_b[0].items():
-                        print(f"    {k}: {str(v)[:200]}", flush=True)
-            with open("debug_raw_json_parsed.json", "w", encoding="utf-8") as f:
-                json.dump(raw_b, f, ensure_ascii=False, default=str, indent=2)
-            if isinstance(raw_b, list): return raw_b
-            elif isinstance(raw_b, dict) and "data" in raw_b and isinstance(raw_b["data"], list): return raw_b["data"]
+            data = resp.json()
+            print(f"  JSON OK! Type: {type(data).__name__}", flush=True)
+            return _extract_and_log(data, "2A")
         except Exception:
-            print(f"  JSON parse failed", flush=True)
-            print(f"  First 2000 chars: {resp.text[:2000]}", flush=True)
+            print(f"  Not JSON. First 2000 chars:", flush=True)
+            print(resp.text[:2000], flush=True)
     except Exception as exc:
         print(f"  FAILED: {exc}", flush=True)
         import traceback; traceback.print_exc()
 
-    # --- Method C: X-Requested-With header ---
+    # --- Method B: X-Requested-With: XMLHttpRequest ---
     print("=" * 60, flush=True)
-    print("STEP 2C: Try with X-Requested-With: XMLHttpRequest", flush=True)
+    print("STEP 2B: Raw request with X-Requested-With + Accept:json", flush=True)
     try:
-        resp2 = session.get(mail_url, headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
-        print(f"  Status: {resp2.status_code}", flush=True)
-        print(f"  Content-Type: {resp2.headers.get('Content-Type', 'unknown')}", flush=True)
+        resp = session.get(mail_url, headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
+        print(f"  Status: {resp.status_code}", flush=True)
+        print(f"  Content-Type: {resp.headers.get('Content-Type', 'unknown')}", flush=True)
+        print(f"  Length: {len(resp.text)} chars", flush=True)
+        with open("debug_resp_b.txt", "w", encoding="utf-8") as f:
+            f.write(resp.text)
         try:
-            raw_c = resp2.json()
-            print(f"  JSON parsed OK, type: {type(raw_c).__name__}", flush=True)
-            if isinstance(raw_c, dict):
-                print(f"  Keys: {list(raw_c.keys())}", flush=True)
-                if "data" in raw_c and isinstance(raw_c["data"], list):
-                    print(f"  data: {len(raw_c['data'])} items", flush=True)
-                    if raw_c["data"] and isinstance(raw_c["data"][0], dict):
-                        print(f"  data[0] keys: {list(raw_c['data'][0].keys())}", flush=True)
-                        for k, v in raw_c["data"][0].items():
-                            print(f"    {k}: {str(v)[:200]}", flush=True)
-            elif isinstance(raw_c, list):
-                print(f"  List length: {len(raw_c)}", flush=True)
-                if raw_c and isinstance(raw_c[0], dict):
-                    print(f"  [0] keys: {list(raw_c[0].keys())}", flush=True)
-            with open("debug_xhr_parsed.json", "w", encoding="utf-8") as f:
-                json.dump(raw_c, f, ensure_ascii=False, default=str, indent=2)
-            if isinstance(raw_c, list): return raw_c
-            elif isinstance(raw_c, dict) and "data" in raw_c and isinstance(raw_c["data"], list): return raw_c["data"]
+            data = resp.json()
+            print(f"  JSON OK! Type: {type(data).__name__}", flush=True)
+            return _extract_and_log(data, "2B")
         except Exception:
-            print(f"  JSON parse failed", flush=True)
-            print(f"  First 1000 chars: {resp2.text[:1000]}", flush=True)
+            print(f"  Not JSON. First 2000 chars:", flush=True)
+            print(resp.text[:2000], flush=True)
     except Exception as exc:
         print(f"  FAILED: {exc}", flush=True)
+        import traceback; traceback.print_exc()
+
+    # --- Method C: DataTables-style params ---
+    print("=" * 60, flush=True)
+    print("STEP 2C: DataTables-style request", flush=True)
+    dt_url = build_mail_url("draw=1")
+    try:
+        resp = session.get(dt_url, headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
+        print(f"  Status: {resp.status_code}", flush=True)
+        print(f"  Content-Type: {resp.headers.get('Content-Type', 'unknown')}", flush=True)
+        print(f"  Length: {len(resp.text)} chars", flush=True)
+        with open("debug_resp_c.txt", "w", encoding="utf-8") as f:
+            f.write(resp.text)
+        try:
+            data = resp.json()
+            print(f"  JSON OK! Type: {type(data).__name__}", flush=True)
+            return _extract_and_log(data, "2C")
+        except Exception:
+            print(f"  Not JSON. First 2000 chars:", flush=True)
+            print(resp.text[:2000], flush=True)
+    except Exception as exc:
+        print(f"  FAILED: {exc}", flush=True)
+        import traceback; traceback.print_exc()
 
     print("=" * 60, flush=True)
-    print("  No email data extracted from any method", flush=True)
+    print("  No email data extracted", flush=True)
+    return []
+
+
+def _extract_and_log(data: Any, label: str) -> List[Dict[str, Any]]:
+    """Extract email list from response and log structure."""
+    with open("debug_data_" + label + ".json", "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, default=str, indent=2)
+
+    if isinstance(data, dict):
+        print(f"  Dict keys: {list(data.keys())}", flush=True)
+        for k, v in data.items():
+            if isinstance(v, list) and v:
+                print(f"  {k}: list of {len(v)} {type(v[0]).__name__}", flush=True)
+                if isinstance(v[0], dict):
+                    print(f"  {k}[0] keys: {list(v[0].keys())}", flush=True)
+                    for ik, iv in v[0].items():
+                        print(f"    {ik}: {str(iv)[:200]}", flush=True)
+            elif isinstance(v, dict):
+                print(f"  {k}: dict (keys: {list(v.keys())[:10]})", flush=True)
+            else:
+                print(f"  {k}: {str(v)[:200]}", flush=True)
+        if "data" in data and isinstance(data["data"], list):
+            return data["data"]
+        for k, v in data.items():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                print(f"  Using '{k}' as email list", flush=True)
+                return v
+    elif isinstance(data, list):
+        print(f"  List length: {len(data)}", flush=True)
+        if data and isinstance(data[0], dict):
+            print(f"  [0] keys: {list(data[0].keys())}", flush=True)
+            for k, v in data[0].items():
+                print(f"    {k}: {str(v)[:200]}", flush=True)
+        return data
+
     return []
 
 
@@ -224,7 +221,7 @@ def parse_email(raw):
     return {"uid": uid_str, "subject": subject, "sender": sender, "date_iso": date_iso, "is_read": is_read, "preview": preview}
 
 def notion_headers():
-    return {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": NOTION_VERSION, "Content-Type": "application/json"}
+    return {"Authorization": "Bearer " + NOTION_TOKEN, "Notion-Version": NOTION_VERSION, "Content-Type": "application/json"}
 
 def get_existing_uids():
     existing = set()
@@ -233,7 +230,7 @@ def get_existing_uids():
     while has_more:
         body = {"page_size": 100}
         if cursor: body["start_cursor"] = cursor
-        resp = requests.post(f"{NOTION_API_URL}/databases/{NOTION_DATABASE_ID}/query", headers=notion_headers(), json=body)
+        resp = requests.post(NOTION_API_URL + "/databases/" + NOTION_DATABASE_ID + "/query", headers=notion_headers(), json=body)
         if resp.status_code != 200: break
         data = resp.json()
         for page in data.get("results", []):
@@ -254,7 +251,7 @@ def create_notion_page(email):
     }
     if email["date_iso"]: properties["Datum"] = {"date": {"start": email["date_iso"]}}
     if email["uid"]: properties["IServ UID"] = {"rich_text": [{"text": {"content": email["uid"]}}]}
-    resp = requests.post(f"{NOTION_API_URL}/pages", headers=notion_headers(), json={"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties})
+    resp = requests.post(NOTION_API_URL + "/pages", headers=notion_headers(), json={"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties})
     if resp.status_code == 200:
         print(f"  Created: {email['subject'][:60]}", flush=True)
         return True
@@ -264,7 +261,7 @@ def create_notion_page(email):
 
 def main():
     print("=" * 60, flush=True)
-    print("IServ -> Notion Sync — DEBUG BUILD v4", flush=True)
+    print("IServ -> Notion Sync — DEBUG BUILD v5", flush=True)
     print("=" * 60, flush=True)
     validate_config()
     try:
