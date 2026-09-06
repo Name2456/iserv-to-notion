@@ -11,15 +11,39 @@ License: MIT
 
 import os
 import sys
-import json
 import time
 import logging
+import importlib.util
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
 import requests
+
+# ---------------------------------------------------------------------------
+# IServAPI bug workaround (v1.4.0)
+# ---------------------------------------------------------------------------
+# IServAPI's __init__.py uses AlarmType, Recurring, and Literal as type hints
+# in the create_event() method but never imports them. The line
+# `from turtle import st` is clearly a mistake — should be typing imports.
+# We patch the installed file before importing to avoid NameError.
+_spec = importlib.util.find_spec("IServAPI")
+if _spec and _spec.origin:
+    with open(_spec.origin, "r") as _f:
+        _content = _f.read()
+    if "from turtle import st" in _content:
+        _content = _content.replace(
+            "from turtle import st",
+            "from typing import Any, Literal",
+        )
+        _content = _content.replace(
+            "\nclass IServAPI:",
+            "\nAlarmType = Any\nRecurring = dict\n\nclass IServAPI:",
+        )
+        with open(_spec.origin, "w") as _f:
+            _f.write(_content)
+        logging.info("Patched IServAPI bug (missing AlarmType/Recurring/Literal)")
+
 from IServAPI import IServAPI
-from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -27,7 +51,7 @@ from bs4 import BeautifulSoup
 
 ISERV_USERNAME = os.environ.get("ISERV_USERNAME")
 ISERV_PASSWORD = os.environ.get("ISERV_PASSWORD")
-ISERV_URL = os.environ.get("ISERV_URL")  # Domain only, e.g. "adolfinum.de" — NOT "https://adolfinum.de/iserv/"
+ISERV_URL = os.environ.get("ISERV_URL")  # Domain only, e.g. "adolfinum.de"
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
 
@@ -65,7 +89,7 @@ def validate_config() -> None:
 
 def fetch_iserv_emails() -> List[Dict[str, Any]]:
     """Connect to IServ and return the latest emails from INBOX."""
-    logger.info(f"Connecting to IServ at {{https://{ISERV_URL}}}/iserv/ …")
+    logger.info(f"Connecting to IServ at https://{ISERV_URL}/iserv/ …")
 
     iserv = IServAPI(
         username=ISERV_USERNAME,
@@ -86,7 +110,6 @@ def fetch_iserv_emails() -> List[Dict[str, Any]]:
     elif isinstance(raw, list):
         emails = raw
     elif isinstance(raw, dict):
-        # Maybe the dict itself is a single email or a wrapper without "data"
         emails = [raw]
     else:
         logger.warning(f"Unexpected response type: {type(raw)}")
