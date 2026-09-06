@@ -1,35 +1,22 @@
 #!/usr/bin/env python3
 """
-IServ to Notion Sync — DEBUG BUILD v5
+IServ to Notion Sync — IMAP version
+Fetches emails via IMAP and syncs them to a Notion database.
 """
 
 import os
 import sys
-import json
 import time
-import logging
-import importlib.util
-from datetime import datetime
-from typing import Dict, List, Any, Optional
-
+import re
+import imaplib
+import email
+from email.header import decode_header, make_header
+from email.utils import parsedate_to_datetime
 import requests
-
-# IServAPI bug workaround
-_spec = importlib.util.find_spec("IServAPI")
-if _spec and _spec.origin:
-    with open(_spec.origin, "r") as _f:
-        _content = _f.read()
-    if "from turtle import st" in _content:
-        _content = _content.replace("from turtle import st", "from typing import Any, Literal")
-        _content = _content.replace("\nclass IServAPI:", "\nAlarmType = Any\nRecurring = dict\n\nclass IServAPI:")
-        with open(_spec.origin, "w") as _f:
-            _f.write(_content)
-
-from IServAPI import IServAPI
 
 ISERV_USERNAME = os.environ.get("ISERV_USERNAME")
 ISERV_PASSWORD = os.environ.get("ISERV_PASSWORD")
-ISERV_URL = os.environ.get("ISERV_URL")
+ISERV_URL = os.environ.get("ISERV_URL", "")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
 
@@ -38,190 +25,175 @@ NOTION_VERSION = "2022-06-28"
 MAX_EMAILS = 50
 RATE_LIMIT_SEC = 0.35
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
 
-
-def validate_config() -> None:
+def validate_config():
     required = ["ISERV_USERNAME", "ISERV_PASSWORD", "ISERV_URL", "NOTION_TOKEN", "NOTION_DATABASE_ID"]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
-        logger.error(f"Missing: {', '.join(missing)}")
+        print(f"Missing env vars: {', '.join(missing)}", flush=True)
         sys.exit(1)
 
 
-def build_mail_url(extra_params=""):
-    """Build mail API URL using string concatenation to avoid f-string brace issues."""
-    base = "https://" + ISERV_URL + "/iserv/mail/api/message/list?path=INBOX&length=" + str(MAX_EMAILS) + "&start=0&order%5Bcolumn%5D=date&order%5Bdir%5D=desc"
-    if extra_params:
-        base += "&" + extra_params
-    return base
+def get_imap_host():
+    """Extract hostname from ISERV_URL (strip protocol/path)."""
+    host = ISERV_URL.strip()
+    host = host.replace("https://", "").replace("http://", "")
+    host = host.replace("/iserv/", "").replace("/iserv", "")
+    host = host.rstrip("/")
+    return host
 
 
-def fetch_and_debug() -> List[Dict[str, Any]]:
-    print("=" * 60, flush=True)
-    print("STEP 1: IServ Login", flush=True)
-    iserv = IServAPI(username=ISERV_USERNAME, password=ISERV_PASSWORD, iserv_url=ISERV_URL)
-    print("  Login: OK", flush=True)
-    session = iserv._session
-
-    mail_url = build_mail_url()
-    print(f"  Mail URL: {mail_url}", flush=True)
-
-    # --- Method A: Accept: application/json ---
-    print("=" * 60, flush=True)
-    print("STEP 2A: Raw request with Accept: application/json", flush=True)
+def decode_mime(value):
+    if value is None:
+        return ""
     try:
-        resp = session.get(mail_url, headers={"Accept": "application/json"})
-        print(f"  Status: {resp.status_code}", flush=True)
-        print(f"  Content-Type: {resp.headers.get('Content-Type', 'unknown')}", flush=True)
-        print(f"  Length: {len(resp.text)} chars", flush=True)
-        with open("debug_resp_a.txt", "w", encoding="utf-8") as f:
-            f.write(resp.text)
-        try:
-            data = resp.json()
-            print(f"  JSON OK! Type: {type(data).__name__}", flush=True)
-            return _extract_and_log(data, "2A")
-        except Exception:
-            print(f"  Not JSON. First 2000 chars:", flush=True)
-            print(resp.text[:2000], flush=True)
-    except Exception as exc:
-        print(f"  FAILED: {exc}", flush=True)
-        import traceback; traceback.print_exc()
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return str(value)
 
-    # --- Method B: X-Requested-With: XMLHttpRequest ---
-    print("=" * 60, flush=True)
-    print("STEP 2B: Raw request with X-Requested-With + Accept:json", flush=True)
+
+def strip_html(text):
+    if not text:
+        return ""
+    s = re.sub(r'<[^>]+>', '', text)
+    s = s.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+    s = s.replace('&quot;', '"').replace('&#39;', "'")
+    return s.strip()
+
+
+def fetch_emails_imap():
+    host = get_imap_host()
+    print(f"Connecting to IMAP {host}:993...", flush=True)
+
     try:
-        resp = session.get(mail_url, headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
-        print(f"  Status: {resp.status_code}", flush=True)
-        print(f"  Content-Type: {resp.headers.get('Content-Type', 'unknown')}", flush=True)
-        print(f"  Length: {len(resp.text)} chars", flush=True)
-        with open("debug_resp_b.txt", "w", encoding="utf-8") as f:
-            f.write(resp.text)
-        try:
-            data = resp.json()
-            print(f"  JSON OK! Type: {type(data).__name__}", flush=True)
-            return _extract_and_log(data, "2B")
-        except Exception:
-            print(f"  Not JSON. First 2000 chars:", flush=True)
-            print(resp.text[:2000], flush=True)
-    except Exception as exc:
-        print(f"  FAILED: {exc}", flush=True)
-        import traceback; traceback.print_exc()
+        imap = imaplib.IMAP4_SSL(host, 993)
+    except Exception as e:
+        print(f"  Connection to {host} failed: {e}", flush=True)
+        alt_host = "imap." + host
+        print(f"  Trying {alt_host}:993...", flush=True)
+        imap = imaplib.IMAP4_SSL(alt_host, 993)
 
-    # --- Method C: DataTables-style params ---
-    print("=" * 60, flush=True)
-    print("STEP 2C: DataTables-style request", flush=True)
-    dt_url = build_mail_url("draw=1")
+    print("  Connected", flush=True)
+
     try:
-        resp = session.get(dt_url, headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
-        print(f"  Status: {resp.status_code}", flush=True)
-        print(f"  Content-Type: {resp.headers.get('Content-Type', 'unknown')}", flush=True)
-        print(f"  Length: {len(resp.text)} chars", flush=True)
-        with open("debug_resp_c.txt", "w", encoding="utf-8") as f:
-            f.write(resp.text)
+        imap.login(ISERV_USERNAME, ISERV_PASSWORD)
+    except Exception as e:
+        print(f"  Login failed with username '{ISERV_USERNAME}': {e}", flush=True)
+        email_user = ISERV_USERNAME
+        if "@" not in email_user:
+            email_user = ISERV_USERNAME + "@" + host
+        print(f"  Trying username '{email_user}'...", flush=True)
+        imap.login(email_user, ISERV_PASSWORD)
+
+    print("  Login OK", flush=True)
+
+    status, data = imap.select("INBOX")
+    if status != "OK":
+        print(f"  Select INBOX failed: {status}", flush=True)
+        imap.logout()
+        return []
+    total = int(data[0])
+    print(f"  INBOX: {total} messages", flush=True)
+
+    status, messages = imap.search(None, "ALL")
+    if status != "OK":
+        print(f"  Search failed: {status}", flush=True)
+        imap.logout()
+        return []
+
+    msg_ids = messages[0].split()
+    print(f"  Found {len(msg_ids)} messages", flush=True)
+
+    fetch_ids = msg_ids[-MAX_EMAILS:] if len(msg_ids) > MAX_EMAILS else msg_ids
+    fetch_ids = list(reversed(fetch_ids))  # newest first
+
+    emails = []
+    for mid in fetch_ids:
         try:
-            data = resp.json()
-            print(f"  JSON OK! Type: {type(data).__name__}", flush=True)
-            return _extract_and_log(data, "2C")
-        except Exception:
-            print(f"  Not JSON. First 2000 chars:", flush=True)
-            print(resp.text[:2000], flush=True)
-    except Exception as exc:
-        print(f"  FAILED: {exc}", flush=True)
-        import traceback; traceback.print_exc()
+            status, fetch_data = imap.fetch(mid, "(UID FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+            if status != "OK":
+                continue
 
-    print("=" * 60, flush=True)
-    print("  No email data extracted", flush=True)
-    return []
+            uid = None
+            flags = []
+            raw_headers = b""
 
+            for item in fetch_data:
+                if isinstance(item, tuple):
+                    meta = item[0].decode("utf-8", errors="ignore") if isinstance(item[0], bytes) else str(item[0])
+                    content = item[1] if isinstance(item[1], bytes) else b""
+                    raw_headers = content
 
-def _extract_and_log(data: Any, label: str) -> List[Dict[str, Any]]:
-    """Extract email list from response and log structure."""
-    with open("debug_data_" + label + ".json", "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, default=str, indent=2)
+                    uid_match = re.search(r'UID (\d+)', meta)
+                    if uid_match:
+                        uid = uid_match.group(1)
 
-    if isinstance(data, dict):
-        print(f"  Dict keys: {list(data.keys())}", flush=True)
-        for k, v in data.items():
-            if isinstance(v, list) and v:
-                print(f"  {k}: list of {len(v)} {type(v[0]).__name__}", flush=True)
-                if isinstance(v[0], dict):
-                    print(f"  {k}[0] keys: {list(v[0].keys())}", flush=True)
-                    for ik, iv in v[0].items():
-                        print(f"    {ik}: {str(iv)[:200]}", flush=True)
-            elif isinstance(v, dict):
-                print(f"  {k}: dict (keys: {list(v.keys())[:10]})", flush=True)
-            else:
-                print(f"  {k}: {str(v)[:200]}", flush=True)
-        if "data" in data and isinstance(data["data"], list):
-            return data["data"]
-        for k, v in data.items():
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                print(f"  Using '{k}' as email list", flush=True)
-                return v
-    elif isinstance(data, list):
-        print(f"  List length: {len(data)}", flush=True)
-        if data and isinstance(data[0], dict):
-            print(f"  [0] keys: {list(data[0].keys())}", flush=True)
-            for k, v in data[0].items():
-                print(f"    {k}: {str(v)[:200]}", flush=True)
-        return data
+                    flags_match = re.search(r'FLAGS \(([^)]*)\)', meta)
+                    if flags_match:
+                        flags = flags_match.group(1).split()
 
-    return []
+            msg = email.message_from_bytes(raw_headers)
+            subject = decode_mime(msg.get("Subject", ""))
+            sender = decode_mime(msg.get("From", ""))
+            date_str = msg.get("Date", "")
 
+            date_iso = None
+            if date_str:
+                try:
+                    dt = parsedate_to_datetime(date_str)
+                    date_iso = dt.isoformat()
+                except Exception:
+                    date_iso = date_str
 
-def _first(row, *keys):
-    for k in keys:
-        if k in row and row[k] is not None: return row[k]
-    return None
+            is_read = "\\Seen" in flags
 
-def _strip_html(text):
-    if text is None: return ""
-    import re
-    s = re.sub(r'<[^>]+>', '', str(text))
-    return s.replace('&amp;','&').replace('&lt;','<').replace('&gt;','>').replace('&quot;','"').replace('&#39;',"'").strip()
+            preview = ""
+            try:
+                status, body_data = imap.fetch(mid, "(BODY.PEEK[1]<0.1000>)")
+                if status == "OK":
+                    for item in body_data:
+                        if isinstance(item, tuple) and isinstance(item[1], bytes):
+                            body_text = item[1].decode("utf-8", errors="ignore")
+                            preview = strip_html(body_text)[:200]
+                            break
+            except Exception:
+                pass
 
-def parse_email(raw):
-    if not isinstance(raw, dict):
-        return {"uid": None, "subject": "(Parse Error)", "sender": "Unbekannt", "date_iso": None, "is_read": False, "preview": ""}
-    uid = _first(raw, "uid","UID","id","ID","message_id","messageId","DT_RowId","rowId","msg","number")
-    subject = _first(raw, "subject","Subject","betreff","Betreff","title","Title","name","Name")
-    sender = _first(raw, "from","From","from_name","sender","absender","fromEmail","from_email","senderEmail")
-    date_val = _first(raw, "date","Date","date_timestamp","timestamp","time","Time","dateReceived","received")
-    seen = _first(raw, "seen","read","is_read","gelesen","unread","isRead","wasRead","flags","flag")
-    preview = _first(raw, "preview","snippet","excerpt","vorschau","text","body","content","previewText")
-    if subject is None: subject = _first(raw, "1","2","0")
-    if sender is None: sender = _first(raw, "2","3","1")
-    if date_val is None: date_val = _first(raw, "3","4","5")
-    subject = _strip_html(subject) if subject else "(Kein Betreff)"
-    sender = _strip_html(sender) if sender else "Unbekannt"
-    preview = _strip_html(preview) if preview else ""
-    if not subject: subject = "(Kein Betreff)"
-    if not sender: sender = "Unbekannt"
-    date_iso = None
-    if date_val is not None:
-        if isinstance(date_val, (int, float)):
-            date_iso = datetime.fromtimestamp(int(date_val)).isoformat()
-        else:
-            ds = _strip_html(date_val)
-            for fmt in ("%Y-%m-%d %H:%M:%S","%Y-%m-%dT%H:%M:%S","%d.%m.%Y %H:%M:%S","%Y-%m-%d %H:%M","%d.%m.%Y","%Y-%m-%d"):
-                try: date_iso = datetime.strptime(ds, fmt).isoformat(); break
-                except ValueError: continue
-            if date_iso is None:
-                try: date_iso = datetime.fromisoformat(ds).isoformat()
-                except: date_iso = datetime.now().isoformat()
-    if isinstance(seen, bool): is_read = seen
-    elif isinstance(seen, str): is_read = seen.lower() in ("true","1","yes","gelesen","read")
-    elif isinstance(seen, (int, float)): is_read = bool(seen)
-    else: is_read = False
-    if preview and len(preview) > 200: preview = preview[:200] + "..."
-    uid_str = str(uid).strip() if uid is not None else None
-    return {"uid": uid_str, "subject": subject, "sender": sender, "date_iso": date_iso, "is_read": is_read, "preview": preview}
+            if not subject:
+                subject = "(Kein Betreff)"
+            if not sender:
+                sender = "Unbekannt"
+            if preview and len(preview) > 200:
+                preview = preview[:200] + "..."
+
+            emails.append({
+                "uid": uid,
+                "subject": subject,
+                "sender": sender,
+                "date_iso": date_iso,
+                "is_read": is_read,
+                "preview": preview,
+            })
+
+            print(f"  Fetched: {subject[:50]} | from={sender[:30]}", flush=True)
+
+        except Exception as e:
+            print(f"  Error fetching message {mid}: {e}", flush=True)
+
+        time.sleep(0.1)
+
+    imap.logout()
+    print(f"  Logged out. Fetched {len(emails)} emails.", flush=True)
+    return emails
+
 
 def notion_headers():
-    return {"Authorization": "Bearer " + NOTION_TOKEN, "Notion-Version": NOTION_VERSION, "Content-Type": "application/json"}
+    return {
+        "Authorization": "Bearer " + NOTION_TOKEN,
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
 
 def get_existing_uids():
     existing = set()
@@ -229,68 +201,94 @@ def get_existing_uids():
     has_more = True
     while has_more:
         body = {"page_size": 100}
-        if cursor: body["start_cursor"] = cursor
-        resp = requests.post(NOTION_API_URL + "/databases/" + NOTION_DATABASE_ID + "/query", headers=notion_headers(), json=body)
-        if resp.status_code != 200: break
+        if cursor:
+            body["start_cursor"] = cursor
+        resp = requests.post(
+            NOTION_API_URL + "/databases/" + NOTION_DATABASE_ID + "/query",
+            headers=notion_headers(),
+            json=body,
+        )
+        if resp.status_code != 200:
+            break
         data = resp.json()
         for page in data.get("results", []):
             props = page.get("properties", {})
             rt = props.get("IServ UID", {}).get("rich_text", [])
-            if rt: existing.add(rt[0].get("plain_text", ""))
+            if rt:
+                existing.add(rt[0].get("plain_text", ""))
         has_more = data.get("has_more", False)
         cursor = data.get("next_cursor")
     return existing
 
-def create_notion_page(email):
+
+def create_notion_page(em):
     properties = {
-        "Betreff": {"title": [{"text": {"content": email["subject"][:2000]}}]},
-        "Absender": {"rich_text": [{"text": {"content": email["sender"][:2000]}}]},
-        "Gelesen": {"checkbox": email["is_read"]},
-        "Vorschau": {"rich_text": [{"text": {"content": email["preview"][:2000]}}]},
+        "Betreff": {"title": [{"text": {"content": em["subject"][:2000]}}]},
+        "Absender": {"rich_text": [{"text": {"content": em["sender"][:2000]}}]},
+        "Gelesen": {"checkbox": em["is_read"]},
+        "Vorschau": {"rich_text": [{"text": {"content": em["preview"][:2000]}}]},
         "Ordner": {"select": {"name": "Posteingang"}},
     }
-    if email["date_iso"]: properties["Datum"] = {"date": {"start": email["date_iso"]}}
-    if email["uid"]: properties["IServ UID"] = {"rich_text": [{"text": {"content": email["uid"]}}]}
-    resp = requests.post(NOTION_API_URL + "/pages", headers=notion_headers(), json={"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties})
+    if em["date_iso"]:
+        properties["Datum"] = {"date": {"start": em["date_iso"]}}
+    if em["uid"]:
+        properties["IServ UID"] = {"rich_text": [{"text": {"content": em["uid"]}}]}
+
+    resp = requests.post(
+        NOTION_API_URL + "/pages",
+        headers=notion_headers(),
+        json={"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties},
+    )
     if resp.status_code == 200:
-        print(f"  Created: {email['subject'][:60]}", flush=True)
+        print(f"  Created: {em['subject'][:60]}", flush=True)
         return True
     else:
         print(f"  Failed ({resp.status_code}): {resp.text[:200]}", flush=True)
         return False
 
+
 def main():
     print("=" * 60, flush=True)
-    print("IServ -> Notion Sync — DEBUG BUILD v5", flush=True)
+    print("IServ -> Notion Sync — IMAP version", flush=True)
     print("=" * 60, flush=True)
     validate_config()
+
     try:
-        raw_emails = fetch_and_debug()
-    except Exception as exc:
-        print(f"FATAL: {exc}", flush=True)
-        import traceback; traceback.print_exc()
+        emails = fetch_emails_imap()
+    except Exception as e:
+        print(f"FATAL: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
-    if not raw_emails:
+
+    if not emails:
         print("No emails to sync.", flush=True)
         return
-    parsed = []
-    for raw in raw_emails:
-        try: parsed.append(parse_email(raw))
-        except Exception as exc: print(f"Parse error: {exc}", flush=True)
-    print(f"\nParsed {len(parsed)} emails", flush=True)
-    for i, email in enumerate(parsed[:3]):
-        print(f"  Email {i}: subject='{email['subject'][:50]}' sender='{email['sender'][:50]}' uid='{email['uid']}'", flush=True)
+
+    print(f"\nFetched {len(emails)} emails", flush=True)
+    for i, em in enumerate(emails[:3]):
+        print(f"  Email {i}: subject='{em['subject'][:50]}' sender='{em['sender'][:50]}' uid='{em['uid']}'", flush=True)
+
     existing = get_existing_uids()
+    print(f"  Existing UIDs in Notion: {len(existing)}", flush=True)
+
     new = skip = err = 0
-    for email in parsed:
-        if email["uid"] and email["uid"] in existing: skip += 1; continue
+    for em in emails:
+        if em["uid"] and em["uid"] in existing:
+            skip += 1
+            continue
         try:
-            if create_notion_page(email): new += 1
-            else: err += 1
-        except Exception as exc:
-            print(f"Create failed: {exc}", flush=True); err += 1
+            if create_notion_page(em):
+                new += 1
+            else:
+                err += 1
+        except Exception as e:
+            print(f"  Create failed: {e}", flush=True)
+            err += 1
         time.sleep(RATE_LIMIT_SEC)
-    print(f"\nSync: {new} new | {skip} skipped | {err} errors", flush=True)
+
+    print(f"\nSync complete: {new} new | {skip} skipped | {err} errors", flush=True)
+
 
 if __name__ == "__main__":
     main()

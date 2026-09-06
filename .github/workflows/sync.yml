@@ -29,17 +29,3 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: python sync.py
-
-      - name: Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: iserv-debug
-          path: |
-            debug_resp_a.txt
-            debug_resp_b.txt
-            debug_resp_c.txt
-            debug_data_2A.json
-            debug_data_2B.json
-            debug_data_2C.json
-          if-no-files-found: ignore
