@@ -19,14 +19,11 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional
 
 import requests
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
 # IServAPI bug workaround (v1.4.0)
 # ---------------------------------------------------------------------------
-# IServAPI's __init__.py uses AlarmType, Recurring, and Literal as type hints
-# in the create_event() method but never imports them. The line
-# `from turtle import st` is clearly a mistake — should be typing imports.
-# We patch the installed file before importing to avoid NameError.
 _spec = importlib.util.find_spec("IServAPI")
 if _spec and _spec.origin:
     with open(_spec.origin, "r") as _f:
@@ -42,7 +39,7 @@ if _spec and _spec.origin:
         )
         with open(_spec.origin, "w") as _f:
             _f.write(_content)
-        logging.info("Patched IServAPI bug (missing AlarmType/Recurring/Literal)")
+        logging.info("Patched IServAPI bug")
 
 from IServAPI import IServAPI
 
@@ -52,76 +49,21 @@ from IServAPI import IServAPI
 
 ISERV_USERNAME = os.environ.get("ISERV_USERNAME")
 ISERV_PASSWORD = os.environ.get("ISERV_PASSWORD")
-ISERV_URL = os.environ.get("ISERV_URL")  # Domain only, e.g. "adolfinum.de"
+ISERV_URL = os.environ.get("ISERV_URL")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
 
 NOTION_API_URL = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
-MAX_EMAILS = 50          # Emails to fetch per run
-RATE_LIMIT_SEC = 0.35   # Delay between Notion API calls
+MAX_EMAILS = 50
+RATE_LIMIT_SEC = 0.35
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.DEBUG,  # DEBUG to see raw response structure
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Debug helpers
-# ---------------------------------------------------------------------------
-
-def _debug_dump_response(raw: Any, label: str = "") -> None:
-    """Log the full structure of the raw IServ response for debugging."""
-    logger.info(f"=== RAW RESPONSE DEBUG{' (' + label + ')' if label else ''} ===")
-    logger.info(f"Type: {type(raw).__name__}")
-
-    if isinstance(raw, dict):
-        logger.info(f"Top-level keys: {list(raw.keys())}")
-        for k, v in raw.items():
-            if k == "data" and isinstance(v, list):
-                logger.info(f"  data: list of {len(v)} items")
-                if v:
-                    if isinstance(v[0], dict):
-                        logger.info(f"  data[0] keys: {list(v[0].keys())}")
-                        for ik, iv in v[0].items():
-                            val_str = str(iv)[:300] if iv is not None else "None"
-                            logger.info(f"    {ik}: {val_str}")
-                    else:
-                        logger.info(f"  data[0] type: {type(v[0]).__name__}, value: {str(v[0])[:300]}")
-            elif isinstance(v, (list, dict)):
-                logger.info(f"  {k}: {type(v).__name__} (len={len(v) if isinstance(v, list) else len(v.keys())})")
-            else:
-                logger.info(f"  {k}: {str(v)[:300] if v is not None else 'None'}")
-    elif isinstance(raw, list):
-        logger.info(f"List length: {len(raw)}")
-        if raw:
-            if isinstance(raw[0], dict):
-                logger.info(f"First item keys: {list(raw[0].keys())}")
-                for k, v in raw[0].items():
-                    logger.info(f"  {k}: {str(v)[:300] if v is not None else 'None'}")
-            else:
-                logger.info(f"First item type: {type(raw[0]).__name__}, value: {str(raw[0])[:300]}")
-    else:
-        logger.info(f"Value: {str(raw)[:500]}")
-    logger.info("=== END RAW RESPONSE DEBUG ===")
-
-
-# ---------------------------------------------------------------------------
-# IServ helpers
-# ---------------------------------------------------------------------------
-
 def validate_config() -> None:
-    """Exit if any required environment variable is missing."""
-    required = [
-        "ISERV_USERNAME", "ISERV_PASSWORD", "ISERV_URL",
-        "NOTION_TOKEN", "NOTION_DATABASE_ID",
-    ]
+    required = ["ISERV_USERNAME", "ISERV_PASSWORD", "ISERV_URL", "NOTION_TOKEN", "NOTION_DATABASE_ID"]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
         logger.error(f"Missing environment variables: {', '.join(missing)}")
@@ -129,60 +71,111 @@ def validate_config() -> None:
 
 
 def fetch_iserv_emails() -> List[Dict[str, Any]]:
-    """Connect to IServ and return the latest emails from INBOX."""
-    logger.info(f"Connecting to IServ at {{https://{ISERV_URL}}}/iserv/ …")
+    """Login to IServ, fetch emails via raw HTTP, return parsed email list."""
+    print("=" * 60, flush=True)
+    print("STEP 1: IServ Login", flush=True)
+    print(f"  URL: {ISERV_URL}", flush=True)
 
     iserv = IServAPI(
         username=ISERV_USERNAME,
         password=ISERV_PASSWORD,
         iserv_url=ISERV_URL,
     )
-    logger.info("IServ login successful")
+    print("  Login: OK", flush=True)
 
-    raw = None
+    # Use the internal session (authenticated) to make a raw request
+    session = iserv._session
+    mail_url = f"{{https://{ISERV_URL}}}/iserv/mail/api/message/list?path=INBOX&length={MAX_EMAILS}&start=0&order%5Bcolumn%5D=date&order%5Bdir%5D=desc"
 
-    # Method 1: get_email_info() — returns .json() directly from API endpoint
-    logger.info(f"Trying get_email_info() (length={MAX_EMAILS}) …")
+    print("=" * 60, flush=True)
+    print("STEP 2: Fetching emails via raw HTTP", flush=True)
+    print(f"  URL: {mail_url}", flush=True)
+
+    resp = session.get(mail_url)
+    print(f"  Status: {resp.status_code}", flush=True)
+    print(f"  Content-Type: {resp.headers.get('Content-Type', 'unknown')}", flush=True)
+    print(f"  Response length: {len(resp.text)} chars", flush=True)
+    print(f"  First 500 chars:\n{resp.text[:500]}", flush=True)
+    print("  ...", flush=True)
+    print(f"  Last 500 chars:\n{resp.text[-500:]}", flush=True)
+
+    # Write raw response to file for artifact upload
+    with open("debug_raw_response.html", "w", encoding="utf-8") as f:
+        f.write(resp.text)
+    print("  Wrote raw response to debug_raw_response.html", flush=True)
+
+    # Try 1: Parse as JSON directly
+    data = None
     try:
-        raw = iserv.get_email_info(
-            path="INBOX", length=MAX_EMAILS, start=0, order="date", dir="desc"
-        )
-        logger.info(f"get_email_info() succeeded, type: {type(raw).__name__}")
-        _debug_dump_response(raw, "get_email_info")
-    except Exception as exc:
-        logger.warning(f"get_email_info() failed: {exc}")
-        raw = None
+        data = resp.json()
+        print("  Parsed as JSON directly: OK", flush=True)
+    except Exception:
+        print("  JSON parse failed, trying HTML parse...", flush=True)
 
-    # Method 2: get_emails() — parses HTML <script id="php-data"> tag
-    if not raw:
-        logger.info(f"Falling back to get_emails() …")
-        try:
-            raw = iserv.get_emails(
-                path="INBOX", length=MAX_EMAILS, start=0, order="date", dir="desc"
-            )
-            logger.info(f"get_emails() succeeded, type: {type(raw).__name__}")
-            _debug_dump_response(raw, "get_emails")
-        except Exception as exc:
-            logger.error(f"get_emails() also failed: {exc}")
-            return []
+    # Try 2: Parse as HTML, extract <script id="php-data">
+    if data is None:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        script_tag = soup.find("script", id="php-data")
+        if script_tag:
+            print("  Found <script id='php-data'> tag", flush=True)
+            raw_content = script_tag.string or ""
+            print(f"  Script content length: {len(raw_content)} chars", flush=True)
+            print(f"  Script first 1000 chars:\n{raw_content[:1000]}", flush=True)
+            try:
+                data = json.loads(raw_content.strip())
+                print("  Parsed script JSON: OK", flush=True)
+            except Exception as exc:
+                print(f"  Script JSON parse failed: {exc}", flush=True)
+                with open("debug_script_content.txt", "w", encoding="utf-8") as f:
+                    f.write(raw_content)
+                print("  Wrote script content to debug_script_content.txt", flush=True)
+        else:
+            print("  No <script id='php-data'> tag found!", flush=True)
+            if "login" in resp.text.lower() or "password" in resp.text.lower():
+                print("  WARNING: Response looks like a login page", flush=True)
 
-    # Extract email list from response
-    if isinstance(raw, dict) and "data" in raw:
-        emails = raw["data"]
-    elif isinstance(raw, list):
-        emails = raw
-    elif isinstance(raw, dict):
-        emails = [raw]
+    if data is None:
+        print("  ERROR: Could not extract email data from response", flush=True)
+        return []
+
+    # Write parsed data to file
+    with open("debug_parsed_data.json", "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, default=str, indent=2)
+    print("  Wrote parsed data to debug_parsed_data.json", flush=True)
+
+    # Extract email list
+    print("=" * 60, flush=True)
+    print("STEP 3: Extracting email list", flush=True)
+    print(f"  Data type: {type(data).__name__}", flush=True)
+
+    if isinstance(data, dict):
+        print(f"  Dict keys: {list(data.keys())}", flush=True)
+        if "data" in data:
+            emails = data["data"]
+            print(f"  Found 'data' key, type: {type(emails).__name__}, length: {len(emails) if isinstance(emails, list) else 'N/A'}", flush=True)
+        else:
+            emails = [data]
+            print("  No 'data' key, wrapping dict in list", flush=True)
+    elif isinstance(data, list):
+        emails = data
+        print(f"  List length: {len(emails)}", flush=True)
     else:
-        logger.warning(f"Unexpected response type: {type(raw)}")
+        print(f"  Unexpected type: {type(data)}", flush=True)
         emails = []
 
-    logger.info(f"Retrieved {len(emails)} emails from IServ")
+    if emails and isinstance(emails[0], dict):
+        print(f"  First email keys: {list(emails[0].keys())}", flush=True)
+        print(f"  First email content:", flush=True)
+        for k, v in emails[0].items():
+            print(f"    {k}: {str(v)[:200]}", flush=True)
+    elif emails:
+        print(f"  First email type: {type(emails[0]).__name__}, value: {str(emails[0])[:200]}", flush=True)
+
+    print(f"  Total emails: {len(emails)}", flush=True)
     return emails
 
 
 def _first(row: Dict[str, Any], *keys: str) -> Optional[Any]:
-    """Return the first non-None value found under any of the given keys."""
     for k in keys:
         if k in row and row[k] is not None:
             return row[k]
@@ -190,11 +183,9 @@ def _first(row: Dict[str, Any], *keys: str) -> Optional[Any]:
 
 
 def _strip_html(text: Any) -> str:
-    """Strip HTML tags from a string value."""
     if text is None:
         return ""
     s = str(text)
-    # Quick HTML tag strip without BeautifulSoup dependency
     import re
     s = re.sub(r'<[^>]+>', '', s)
     s = s.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
@@ -203,25 +194,16 @@ def _strip_html(text: Any) -> str:
 
 
 def parse_email(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalise a raw IServ email dict into a flat record."""
-    # Log all keys of this email for debugging
-    logger.debug(f"parse_email keys: {list(raw.keys()) if isinstance(raw, dict) else type(raw)}")
+    if not isinstance(raw, dict):
+        return {"uid": None, "subject": "(Parse Error)", "sender": "Unbekannt", "date_iso": None, "is_read": False, "preview": ""}
 
-    # Try many possible field names, including DataTables-style numbered columns
-    uid = _first(raw, "uid", "UID", "id", "ID", "message_id", "messageId",
-                 "DT_RowId", "rowId", "msg", "messageId", "number")
-    subject = _first(raw, "subject", "Subject", "betreff", "Betreff",
-                    "title", "Title", "name", "Name")
-    sender = _first(raw, "from", "From", "from_name", "sender", "absender",
-                    "fromEmail", "from_email", "senderEmail", "sender_email")
-    date_val = _first(raw, "date", "Date", "date_timestamp", "timestamp",
-                      "time", "Time", "dateReceived", "received")
-    seen = _first(raw, "seen", "read", "is_read", "gelesen", "unread",
-                  "isRead", "wasRead", "flags", "flag")
-    preview = _first(raw, "preview", "snippet", "excerpt", "vorschau", "text",
-                     "body", "content", "previewText", "preview_text")
+    uid = _first(raw, "uid", "UID", "id", "ID", "message_id", "messageId", "DT_RowId", "rowId", "msg", "number")
+    subject = _first(raw, "subject", "Subject", "betreff", "Betreff", "title", "Title", "name", "Name")
+    sender = _first(raw, "from", "From", "from_name", "sender", "absender", "fromEmail", "from_email", "senderEmail")
+    date_val = _first(raw, "date", "Date", "date_timestamp", "timestamp", "time", "Time", "dateReceived", "received")
+    seen = _first(raw, "seen", "read", "is_read", "gelesen", "unread", "isRead", "wasRead", "flags", "flag")
+    preview = _first(raw, "preview", "snippet", "excerpt", "vorschau", "text", "body", "content", "previewText")
 
-    # If named fields not found, try numbered DataTables columns
     if subject is None:
         subject = _first(raw, "1", "2", "0")
     if sender is None:
@@ -229,25 +211,21 @@ def parse_email(raw: Dict[str, Any]) -> Dict[str, Any]:
     if date_val is None:
         date_val = _first(raw, "3", "4", "5")
 
-    # Strip HTML from values (IServ DataTables may include HTML markup)
     subject = _strip_html(subject) if subject else "(Kein Betreff)"
     sender = _strip_html(sender) if sender else "Unbekannt"
     preview = _strip_html(preview) if preview else ""
-
     if not subject:
         subject = "(Kein Betreff)"
     if not sender:
         sender = "Unbekannt"
 
-    # Date — try Unix timestamp, then common string formats
     date_iso: Optional[str] = None
     if date_val is not None:
         if isinstance(date_val, (int, float)):
             date_iso = datetime.fromtimestamp(int(date_val)).isoformat()
         else:
             ds = _strip_html(date_val)
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M:%S",
-                        "%Y-%m-%d %H:%M", "%d.%m.%Y", "%Y-%m-%d"):
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y", "%Y-%m-%d"):
                 try:
                     date_iso = datetime.strptime(ds, fmt).isoformat()
                     break
@@ -257,10 +235,8 @@ def parse_email(raw: Dict[str, Any]) -> Dict[str, Any]:
                 try:
                     date_iso = datetime.fromisoformat(ds).isoformat()
                 except (ValueError, TypeError):
-                    logger.warning(f"Could not parse date: {ds}")
                     date_iso = datetime.now().isoformat()
 
-    # Read status
     if isinstance(seen, bool):
         is_read = seen
     elif isinstance(seen, str):
@@ -270,55 +246,28 @@ def parse_email(raw: Dict[str, Any]) -> Dict[str, Any]:
     else:
         is_read = False
 
-    # Preview
     if preview and len(preview) > 200:
         preview = preview[:200] + "…"
 
-    # UID
     uid_str = str(uid).strip() if uid is not None else None
+    return {"uid": uid_str, "subject": subject, "sender": sender, "date_iso": date_iso, "is_read": is_read, "preview": preview}
 
-    return {
-        "uid": uid_str,
-        "subject": subject,
-        "sender": sender,
-        "date_iso": date_iso,
-        "is_read": is_read,
-        "preview": preview,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Notion helpers
-# ---------------------------------------------------------------------------
 
 def notion_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": NOTION_VERSION,
-        "Content-Type": "application/json",
-    }
-
+    return {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": NOTION_VERSION, "Content-Type": "application/json"}
 
 def get_existing_uids() -> set:
-    """Return the set of all IServ UIDs already stored in Notion."""
     existing = set()
     cursor = None
     has_more = True
-
     while has_more:
         body = {"page_size": 100}
         if cursor:
             body["start_cursor"] = cursor
-
-        resp = requests.post(
-            f"{NOTION_API_URL}/databases/{NOTION_DATABASE_ID}/query",
-            headers=notion_headers(),
-            json=body,
-        )
+        resp = requests.post(f"{NOTION_API_URL}/databases/{NOTION_DATABASE_ID}/query", headers=notion_headers(), json=body)
         if resp.status_code != 200:
             logger.error(f"Notion query failed: {resp.status_code} — {resp.text[:300]}")
             break
-
         data = resp.json()
         for page in data.get("results", []):
             props = page.get("properties", {})
@@ -326,16 +275,12 @@ def get_existing_uids() -> set:
             rt = uid_prop.get("rich_text", [])
             if rt:
                 existing.add(rt[0].get("plain_text", ""))
-
         has_more = data.get("has_more", False)
         cursor = data.get("next_cursor")
-
     logger.info(f"Found {len(existing)} existing emails in Notion")
     return existing
 
-
 def create_notion_page(email: Dict[str, Any]) -> bool:
-    """Create a single page in the Notion database. Returns True on success."""
     properties = {
         "Betreff": {"title": [{"text": {"content": email["subject"][:2000]}}]},
         "Absender": {"rich_text": [{"text": {"content": email["sender"][:2000]}}]},
@@ -343,59 +288,50 @@ def create_notion_page(email: Dict[str, Any]) -> bool:
         "Vorschau": {"rich_text": [{"text": {"content": email["preview"][:2000]}}]},
         "Ordner": {"select": {"name": "Posteingang"}},
     }
-
     if email["date_iso"]:
         properties["Datum"] = {"date": {"start": email["date_iso"]}}
-
     if email["uid"]:
         properties["IServ UID"] = {"rich_text": [{"text": {"content": email["uid"]}}]}
-
-    resp = requests.post(
-        f"{NOTION_API_URL}/pages",
-        headers=notion_headers(),
-        json={"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties},
-    )
-
+    resp = requests.post(f"{NOTION_API_URL}/pages", headers=notion_headers(), json={"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties})
     if resp.status_code == 200:
-        logger.info(f"  ✓ Created: {email['subject'][:60]}")
+        logger.info(f"  Created: {email['subject'][:60]}")
         return True
     else:
-        logger.error(f"  ✗ Failed ({resp.status_code}): {resp.text[:200]}")
+        logger.error(f"  Failed ({resp.status_code}): {resp.text[:200]}")
         return False
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main() -> None:
-    logger.info("═══ IServ → Notion Sync ═══")
+    print("=" * 60, flush=True)
+    print("IServ -> Notion Sync — DEBUG BUILD", flush=True)
+    print("=" * 60, flush=True)
     validate_config()
 
-    # 1. Fetch emails from IServ
     try:
         raw_emails = fetch_iserv_emails()
     except Exception as exc:
-        logger.error(f"IServ fetch failed: {exc}")
+        print(f"FATAL: IServ fetch failed: {exc}", flush=True)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
     if not raw_emails:
-        logger.info("No emails to sync — done.")
+        print("No emails to sync — done.", flush=True)
         return
 
-    # 2. Parse
     parsed = []
     for raw in raw_emails:
         try:
             parsed.append(parse_email(raw))
         except Exception as exc:
-            logger.error(f"Parse error for one email: {exc}")
-    logger.info(f"Parsed {len(parsed)} emails")
+            print(f"Parse error: {exc}", flush=True)
+    print(f"\nParsed {len(parsed)} emails", flush=True)
 
-    # 3. Dedup
+    for i, email in enumerate(parsed[:3]):
+        print(f"  Email {i}: subject='{email['subject'][:50]}' sender='{email['sender'][:50]}' date='{email['date_iso']}' uid='{email['uid']}'", flush=True)
+
     existing = get_existing_uids()
 
-    # 4. Create new pages
     new = skip = err = 0
     for email in parsed:
         if email["uid"] and email["uid"] in existing:
@@ -407,11 +343,11 @@ def main() -> None:
             else:
                 err += 1
         except Exception as exc:
-            logger.error(f"Create page failed for '{email['subject'][:40]}': {exc}")
+            print(f"Create page failed: {exc}", flush=True)
             err += 1
         time.sleep(RATE_LIMIT_SEC)
 
-    logger.info(f"═══ Sync complete: {new} new | {skip} skipped | {err} errors ═══")
+    print(f"\nSync complete: {new} new | {skip} skipped | {err} errors", flush=True)
 
 
 if __name__ == "__main__":
