@@ -11,6 +11,7 @@ License: MIT
 
 import os
 import sys
+import json
 import time
 import logging
 import importlib.util
@@ -65,10 +66,50 @@ RATE_LIMIT_SEC = 0.35   # Delay between Notion API calls
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # DEBUG to see raw response structure
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Debug helpers
+# ---------------------------------------------------------------------------
+
+def _debug_dump_response(raw: Any, label: str = "") -> None:
+    """Log the full structure of the raw IServ response for debugging."""
+    logger.info(f"=== RAW RESPONSE DEBUG{' (' + label + ')' if label else ''} ===")
+    logger.info(f"Type: {type(raw).__name__}")
+
+    if isinstance(raw, dict):
+        logger.info(f"Top-level keys: {list(raw.keys())}")
+        for k, v in raw.items():
+            if k == "data" and isinstance(v, list):
+                logger.info(f"  data: list of {len(v)} items")
+                if v:
+                    if isinstance(v[0], dict):
+                        logger.info(f"  data[0] keys: {list(v[0].keys())}")
+                        for ik, iv in v[0].items():
+                            val_str = str(iv)[:300] if iv is not None else "None"
+                            logger.info(f"    {ik}: {val_str}")
+                    else:
+                        logger.info(f"  data[0] type: {type(v[0]).__name__}, value: {str(v[0])[:300]}")
+            elif isinstance(v, (list, dict)):
+                logger.info(f"  {k}: {type(v).__name__} (len={len(v) if isinstance(v, list) else len(v.keys())})")
+            else:
+                logger.info(f"  {k}: {str(v)[:300] if v is not None else 'None'}")
+    elif isinstance(raw, list):
+        logger.info(f"List length: {len(raw)}")
+        if raw:
+            if isinstance(raw[0], dict):
+                logger.info(f"First item keys: {list(raw[0].keys())}")
+                for k, v in raw[0].items():
+                    logger.info(f"  {k}: {str(v)[:300] if v is not None else 'None'}")
+            else:
+                logger.info(f"First item type: {type(raw[0]).__name__}, value: {str(raw[0])[:300]}")
+    else:
+        logger.info(f"Value: {str(raw)[:500]}")
+    logger.info("=== END RAW RESPONSE DEBUG ===")
 
 
 # ---------------------------------------------------------------------------
@@ -89,22 +130,43 @@ def validate_config() -> None:
 
 def fetch_iserv_emails() -> List[Dict[str, Any]]:
     """Connect to IServ and return the latest emails from INBOX."""
-    logger.info(f"Connecting to IServ at https://{ISERV_URL}/iserv/ …")
+    logger.info(f"Connecting to IServ at {{https://{ISERV_URL}}}/iserv/ …")
 
     iserv = IServAPI(
         username=ISERV_USERNAME,
         password=ISERV_PASSWORD,
-        iserv_url=ISERV_URL,  # library appends /iserv/ itself
+        iserv_url=ISERV_URL,
     )
     logger.info("IServ login successful")
 
-    logger.info(f"Fetching latest {MAX_EMAILS} emails from INBOX …")
-    raw = iserv.get_emails(
-        path="INBOX", length=MAX_EMAILS, start=0, order="date", dir="desc"
-    )
+    raw = None
 
-    # get_emails() returns parsed JSON from IServ's <script id="php-data"> tag.
-    # The structure may be {"data": [...], ...} or a bare list.
+    # Method 1: get_email_info() — returns .json() directly from API endpoint
+    logger.info(f"Trying get_email_info() (length={MAX_EMAILS}) …")
+    try:
+        raw = iserv.get_email_info(
+            path="INBOX", length=MAX_EMAILS, start=0, order="date", dir="desc"
+        )
+        logger.info(f"get_email_info() succeeded, type: {type(raw).__name__}")
+        _debug_dump_response(raw, "get_email_info")
+    except Exception as exc:
+        logger.warning(f"get_email_info() failed: {exc}")
+        raw = None
+
+    # Method 2: get_emails() — parses HTML <script id="php-data"> tag
+    if not raw:
+        logger.info(f"Falling back to get_emails() …")
+        try:
+            raw = iserv.get_emails(
+                path="INBOX", length=MAX_EMAILS, start=0, order="date", dir="desc"
+            )
+            logger.info(f"get_emails() succeeded, type: {type(raw).__name__}")
+            _debug_dump_response(raw, "get_emails")
+        except Exception as exc:
+            logger.error(f"get_emails() also failed: {exc}")
+            return []
+
+    # Extract email list from response
     if isinstance(raw, dict) and "data" in raw:
         emails = raw["data"]
     elif isinstance(raw, list):
@@ -116,9 +178,6 @@ def fetch_iserv_emails() -> List[Dict[str, Any]]:
         emails = []
 
     logger.info(f"Retrieved {len(emails)} emails from IServ")
-    if emails:
-        logger.debug(f"First email keys: {list(emails[0].keys()) if isinstance(emails[0], dict) else 'N/A'}")
-
     return emails
 
 
@@ -130,20 +189,55 @@ def _first(row: Dict[str, Any], *keys: str) -> Optional[Any]:
     return None
 
 
+def _strip_html(text: Any) -> str:
+    """Strip HTML tags from a string value."""
+    if text is None:
+        return ""
+    s = str(text)
+    # Quick HTML tag strip without BeautifulSoup dependency
+    import re
+    s = re.sub(r'<[^>]+>', '', s)
+    s = s.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+    s = s.replace('&quot;', '"').replace('&#39;', "'").replace('&nbsp;', ' ')
+    return s.strip()
+
+
 def parse_email(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Normalise a raw IServ email dict into a flat record."""
-    uid = _first(raw, "uid", "UID", "id", "ID", "message_id", "messageId")
-    subject = _first(raw, "subject", "Subject", "betreff", "Betreff")
-    sender = _first(raw, "from", "From", "from_name", "sender", "absender")
-    date_val = _first(raw, "date", "Date", "date_timestamp", "timestamp")
-    seen = _first(raw, "seen", "read", "is_read", "gelesen")
-    preview = _first(raw, "preview", "snippet", "excerpt", "vorschau", "text")
+    # Log all keys of this email for debugging
+    logger.debug(f"parse_email keys: {list(raw.keys()) if isinstance(raw, dict) else type(raw)}")
 
-    # Subject
-    subject = str(subject).strip() if subject else "(Kein Betreff)"
+    # Try many possible field names, including DataTables-style numbered columns
+    uid = _first(raw, "uid", "UID", "id", "ID", "message_id", "messageId",
+                 "DT_RowId", "rowId", "msg", "messageId", "number")
+    subject = _first(raw, "subject", "Subject", "betreff", "Betreff",
+                    "title", "Title", "name", "Name")
+    sender = _first(raw, "from", "From", "from_name", "sender", "absender",
+                    "fromEmail", "from_email", "senderEmail", "sender_email")
+    date_val = _first(raw, "date", "Date", "date_timestamp", "timestamp",
+                      "time", "Time", "dateReceived", "received")
+    seen = _first(raw, "seen", "read", "is_read", "gelesen", "unread",
+                  "isRead", "wasRead", "flags", "flag")
+    preview = _first(raw, "preview", "snippet", "excerpt", "vorschau", "text",
+                     "body", "content", "previewText", "preview_text")
 
-    # Sender
-    sender = str(sender).strip() if sender else "Unbekannt"
+    # If named fields not found, try numbered DataTables columns
+    if subject is None:
+        subject = _first(raw, "1", "2", "0")
+    if sender is None:
+        sender = _first(raw, "2", "3", "1")
+    if date_val is None:
+        date_val = _first(raw, "3", "4", "5")
+
+    # Strip HTML from values (IServ DataTables may include HTML markup)
+    subject = _strip_html(subject) if subject else "(Kein Betreff)"
+    sender = _strip_html(sender) if sender else "Unbekannt"
+    preview = _strip_html(preview) if preview else ""
+
+    if not subject:
+        subject = "(Kein Betreff)"
+    if not sender:
+        sender = "Unbekannt"
 
     # Date — try Unix timestamp, then common string formats
     date_iso: Optional[str] = None
@@ -151,8 +245,9 @@ def parse_email(raw: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(date_val, (int, float)):
             date_iso = datetime.fromtimestamp(int(date_val)).isoformat()
         else:
-            ds = str(date_val).strip()
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d %H:%M"):
+            ds = _strip_html(date_val)
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M:%S",
+                        "%Y-%m-%d %H:%M", "%d.%m.%Y", "%Y-%m-%d"):
                 try:
                     date_iso = datetime.strptime(ds, fmt).isoformat()
                     break
@@ -169,17 +264,15 @@ def parse_email(raw: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(seen, bool):
         is_read = seen
     elif isinstance(seen, str):
-        is_read = seen.lower() in ("true", "1", "yes", "gelesen")
+        is_read = seen.lower() in ("true", "1", "yes", "gelesen", "read")
+    elif isinstance(seen, (int, float)):
+        is_read = bool(seen)
     else:
         is_read = False
 
     # Preview
-    if preview:
-        preview = str(preview).strip()
-        if len(preview) > 200:
-            preview = preview[:200] + "…"
-    else:
-        preview = ""
+    if preview and len(preview) > 200:
+        preview = preview[:200] + "…"
 
     # UID
     uid_str = str(uid).strip() if uid is not None else None
