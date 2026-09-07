@@ -530,7 +530,8 @@ class Matrix:
         for user in candidates:
             body = {
                 "type": "m.login.password",
-                "identifier": {"type": "m.user", "user": user},
+                "identifier": {"type": "m.id.user", "user": user},
+                "user": user,  # Legacy-Feld als Fallback fuer aeltere Server
                 "password": password,
                 "initial_device_display_name": "Notion Sync (GitHub Actions)",
             }
