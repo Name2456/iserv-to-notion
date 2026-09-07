@@ -167,9 +167,10 @@ def extract_attachments(msg):
 
 
 def upload_file_to_notion(filename, content, content_type):
-    """Upload a file to Notion via the File Upload API. Returns file_upload_id or None."""
+    """Upload a file to Notion via the File Upload API. Returns file_upload_id or None.
+    NOTE: valid modes are single_part / multi_part / external_url — "upload" is invalid (was a bug)."""
     try:
-        create_resp = requests.post(NOTION_API_URL + "/file_uploads", headers=notion_headers(), json={"mode": "upload", "filename": filename, "content_type": content_type})
+        create_resp = requests.post(NOTION_API_URL + "/file_uploads", headers=notion_headers(), json={"mode": "single_part", "filename": filename, "content_type": content_type})
         if create_resp.status_code != 200:
             print(f"    File upload create failed: {create_resp.status_code} {create_resp.text[:200]}", flush=True)
             return None
@@ -178,6 +179,8 @@ def upload_file_to_notion(filename, content, content_type):
         if send_resp.status_code != 200:
             print(f"    File upload send failed: {send_resp.status_code} {send_resp.text[:200]}", flush=True)
             return None
+        if send_resp.json().get("status") == "uploaded":
+            return file_upload_id
         for _ in range(10):
             time.sleep(1)
             status_resp = requests.get(NOTION_API_URL + "/file_uploads/" + file_upload_id, headers=notion_headers())
@@ -294,7 +297,7 @@ def create_notion_page(em, data_source_id):
     for att in em.get("attachments", []):
         file_upload_id = upload_file_to_notion(att["filename"], att["content"], att["content_type"])
         if file_upload_id:
-            file_uploads.append({"type": "file_upload", "file_upload": {"id": file_upload_id}, "name": att["filename"]})
+            file_uploads.append({"type": "file_upload", "file_upload": {"id": file_upload_id}, "name": att["filename"][:100]})
             print(f"    Uploaded: {att['filename']}", flush=True)
     if file_uploads:
         properties["Anhang"] = {"files": file_uploads}
@@ -326,7 +329,7 @@ def main():
     validate_config()
     data_source_id = get_data_source_id()
     ensure_anhang_property(data_source_id)
-    delete_all_pages(data_source_id)
+    # Fetch FIRST, delete afterwards — if IServ is unreachable, the old entries stay in Notion
     try:
         emails = fetch_emails_imap()
     except Exception as e:
@@ -334,6 +337,7 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    delete_all_pages(data_source_id)
     if not emails:
         print("No emails to sync.", flush=True)
         return

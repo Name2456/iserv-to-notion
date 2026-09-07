@@ -2,14 +2,23 @@ name: IServ to Notion Sync
 
 on:
   schedule:
+    # Täglich 8:23 Uhr MESZ (6:23 UTC)
     - cron: '23 6 * * *'
-    # Backup trigger 20 min later in case first is delayed/skipped
+    # Backup-Trigger 20 Minuten später, falls der erste verzögert/übersprungen wird
     - cron: '43 6 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iserv-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
