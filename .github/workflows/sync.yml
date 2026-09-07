@@ -2,10 +2,10 @@ name: IServ to Notion Sync
 
 on:
   schedule:
-    # Täglich 8:23 Uhr MESZ (6:23 UTC)
-    - cron: '23 6 * * *'
-    # Backup-Trigger 20 Minuten später, falls der erste verzögert/übersprungen wird
-    - cron: '43 6 * * *'
+    # Mo–Fr alle 30 Minuten, 7:00–20:30 Uhr MESZ (5–18 UTC)
+    - cron: '*/30 5-18 * * 1-5'
+    # Sa/So einmal morgens (9:13 Uhr MESZ)
+    - cron: '13 7 * * 0,6'
   workflow_dispatch:
 
 permissions:
@@ -18,7 +18,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -37,4 +37,5 @@ jobs:
           ISERV_URL: ${{ secrets.ISERV_URL }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          NOTION_MESSENGER_DATABASE_ID: ${{ secrets.NOTION_MESSENGER_DATABASE_ID }}
         run: python sync.py
