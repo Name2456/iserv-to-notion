@@ -37,5 +37,6 @@ jobs:
           ISERV_URL: ${{ secrets.ISERV_URL }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-          NOTION_MESSENGER_DATABASE_ID: ${{ secrets.NOTION_MESSENGER_DATABASE_ID }}
+          # Messenger-DB-ID ist im Skript hinterlegt; bei Bedarf hier als Secret setzen:
+          # NOTION_MESSENGER_DATABASE_ID: ${{ secrets.NOTION_MESSENGER_DATABASE_ID }}
         run: python sync.py
