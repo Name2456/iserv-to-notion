@@ -38,7 +38,7 @@ ISERV_URL = os.environ.get("ISERV_URL", "")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 # Messenger-Datenbank: kann per Secret ueberschrieben werden, Default = die angelegte DB
-NOTION_MESSENGER_DATABASE_ID = os.environ.get("NOTION_MESSENGER_DATABASE_ID", "0700ab1a5abc46a28b9377d0b018d636")
+NOTION_MESSENGER_DATABASE_ID = os.environ.get("NOTION_MESSENGER_DATABASE_ID") or "0700ab1a5abc46a28b9377d0b018d636"
 MESSENGER_ENABLED = os.environ.get("MESSENGER_ENABLED", "true").lower() not in ("0", "false", "no")
 
 NOTION_API_URL = "https://api.notion.com/v1"
@@ -47,6 +47,8 @@ DAYS_BACK = 30
 RATE_LIMIT_SEC = 0.35
 BODY_MAX_CHARS = 4000
 MAX_FILE_SIZE = 20 * 1024 * 1024  # Notion single_part Limit
+# Notion zaehlt Zeichen in UTF-16 (Emojis = 2) -> Puffer unter dem 2000er Limit lassen
+TEXT_LIMIT = 1900
 HTTP_TIMEOUT = 60
 
 MATRIX_FILE_MSGTYPES = {
@@ -203,7 +205,7 @@ def select_name(value):
     return value[:100] or "Unbekannt"
 
 
-def rt(value, limit=2000):
+def rt(value, limit=TEXT_LIMIT):
     return {"rich_text": [{"text": {"content": (value or "")[:limit]}}]}
 
 
@@ -385,7 +387,7 @@ def fetch_emails_imap(full_fetch_needed):
 
 def create_email_page(em, data_source_id):
     properties = {
-        "Betreff": {"title": [{"text": {"content": em["subject"][:2000]}}]},
+        "Betreff": {"title": [{"text": {"content": em["subject"][:TEXT_LIMIT]}}]},
         "Absender": rt(em["sender"]),
         "Gelesen": {"checkbox": em["is_read"]},
         "Vorschau": rt(em["preview"]),
@@ -407,7 +409,7 @@ def create_email_page(em, data_source_id):
         children.append({"object": "block", "type": "divider", "divider": {}})
         remaining = em["body"]
         while remaining and len(children) < 5:
-            chunk, remaining = remaining[:2000], remaining[2000:]
+            chunk, remaining = remaining[:TEXT_LIMIT], remaining[TEXT_LIMIT:]
             children.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": chunk}}]}})
     payload = {"parent": {"data_source_id": data_source_id}, "properties": properties}
     if children:
@@ -665,7 +667,7 @@ def create_messenger_page(mx, f, data_source_id):
         return False
     fid = upload_file_to_notion(f["filename"], content, f["mimetype"] if f["mimetype"] != "application/octet-stream" else ctype)
     properties = {
-        "Name": {"title": [{"text": {"content": f["filename"][:2000]}}]},
+        "Name": {"title": [{"text": {"content": f["filename"][:TEXT_LIMIT]}}]},
         "Chat": {"select": {"name": select_name(f["chat"])}},
         "Absender": rt(f["sender"]),
         "Datum": {"date": {"start": datetime.fromtimestamp(f["ts"] / 1000.0, tz=timezone.utc).isoformat()}},
@@ -752,7 +754,11 @@ def main():
             ok = sync_messenger() and ok
         except Exception as e:
             log(f"FEHLER Messenger-Sync: {e}")
-            traceback.print_exc()
+            if "404" in str(e):
+                log("  -> Die Messenger-Datenbank ist nicht mit der Notion-Integration verbunden.")
+                log("     In Notion: Datenbank 'IServ Messenger' oeffnen -> ... -> Verbindungen -> Integration hinzufuegen.")
+            else:
+                traceback.print_exc()
             ok = False
     else:
         log("Messenger-Sync deaktiviert.")
