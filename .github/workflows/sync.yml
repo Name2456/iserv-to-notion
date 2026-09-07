@@ -3,6 +3,8 @@ name: IServ to Notion Sync
 on:
   schedule:
     - cron: '23 6 * * *'
+    # Backup trigger 20 min later in case first is delayed/skipped
+    - cron: '43 6 * * *'
   workflow_dispatch:
 
 jobs:
