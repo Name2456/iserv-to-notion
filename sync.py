@@ -10,6 +10,8 @@ Beide Syncs sind INKREMENTELL:
 - Eintraege ausserhalb des Zeitfensters werden in den Papierkorb verschoben
 - Gelesen-Status von Mails wird aktualisiert
 - Mails, die frueher ohne Anhang gespeichert wurden, werden einmalig repariert
+- Eintraege mit angekreuzter "Ignorieren"-Checkbox bleiben unangetastet stehen
+  und werden nicht neu angelegt, auch wenn die Quelle sie noch liefert.
 
 Der IServ-Messenger basiert auf Matrix; der Homeserver ist die IServ-Domain.
 Login erfolgt mit den normalen IServ-Zugangsdaten (m.login.password).
@@ -428,15 +430,16 @@ def sync_emails():
     log("-" * 60)
     ds_id = get_data_source_id(NOTION_DATABASE_ID)
     ensure_property(ds_id, "Anhang", {"files": {}})
+    ensure_property(ds_id, "Ignorieren", {"checkbox": {}})
 
-    existing = {}      # uid -> {page_id, is_read, has_attachment}
+    existing = {}      # uid -> {page_id, is_read, has_attachment, ignored}
     to_trash = []      # Seiten ohne UID / Duplikate
     for page in query_all_pages(ds_id):
         uid = prop_plain_text(page, "IServ UID")
         if not uid or uid in existing:
             to_trash.append(page["id"])
             continue
-        existing[uid] = {"page_id": page["id"], "is_read": prop_checkbox(page, "Gelesen"), "has_attachment": prop_has_files(page, "Anhang")}
+        existing[uid] = {"page_id": page["id"], "is_read": prop_checkbox(page, "Gelesen"), "has_attachment": prop_has_files(page, "Anhang"), "ignored": prop_checkbox(page, "Ignorieren")}
     log(f"  {len(existing)} Mails bereits in Notion")
 
     def needs_full(uid):
@@ -452,6 +455,8 @@ def sync_emails():
         try:
             if uid in existing:
                 ex = existing[uid]
+                if ex.get("ignored"):
+                    continue
                 if em["full"] and em.get("attachments") and not ex["has_attachment"]:
                     # Frueher ohne Anhang gespeichert -> neu anlegen
                     trash_page(ex["page_id"])
@@ -475,7 +480,7 @@ def sync_emails():
             errors += 1
 
     for uid, ex in existing.items():
-        if uid not in present:
+        if uid not in present and not ex.get("ignored"):
             to_trash.append(ex["page_id"])
     trashed = sum(1 for pid in to_trash if trash_page(pid))
     log(f"E-Mails: {created} neu | {repaired} repariert | {updated} Status aktualisiert | {trashed} entfernt | {errors} Fehler")
@@ -691,6 +696,7 @@ def sync_messenger():
     log("MESSENGER")
     log("-" * 60)
     ds_id = get_data_source_id(NOTION_MESSENGER_DATABASE_ID)
+    ensure_property(ds_id, "Ignorieren", {"checkbox": {}})
 
     existing = {}
     to_trash = []
@@ -699,7 +705,7 @@ def sync_messenger():
         if not eid or eid in existing:
             to_trash.append(page["id"])
             continue
-        existing[eid] = page["id"]
+        existing[eid] = {"page_id": page["id"], "ignored": prop_checkbox(page, "Ignorieren")}
     log(f"  {len(existing)} Dateien bereits in Notion")
 
     cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=DAYS_BACK)).timestamp() * 1000)
@@ -728,9 +734,9 @@ def sync_messenger():
     finally:
         mx.logout()
 
-    for eid, pid in existing.items():
-        if eid not in present:
-            to_trash.append(pid)
+    for eid, info in existing.items():
+        if eid not in present and not info.get("ignored"):
+            to_trash.append(info["page_id"])
     trashed = sum(1 for pid in to_trash if trash_page(pid))
     log(f"Messenger: {created} neu | {trashed} entfernt | {errors} Fehler")
     return errors == 0
